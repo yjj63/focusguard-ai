@@ -1,7 +1,10 @@
 /**
- * FocusGuard AI 主应用控制器（v3.0 正式版）
- * 新增：3D 头部姿态方位仪 HUD、番茄专注时钟智能联动、20-20-20 护眼放松弹窗、
- *      本地历史学习档案持久化（localStorage）、深浅双主题切换
+ * FocusGuard AI 主应用控制器（v4.0 正式版）
+ * 核心工程稳健性改进：
+ * 1. 仅在视频新帧到来（video.currentTime 变化）且严格递增整数时间戳下调用 detectForVideo，加 try/catch 永不假死
+ * 2. 移动端自动优先使用稳定 CPU/WASM delegate 并调优置信度阈值（0.40），避免 iOS WebGL 上下文丢帧或摘眼镜丢脸
+ * 3. 动态同步视频流真实分辨率与容器纵横比，保证手机竖屏/电脑横屏下关键点网格 100% 像素级对齐人脸
+ * 4. 启动摄像头后前 10 帧稳定人脸自动静默校准，同时保留“校准标准坐姿”按钮随时手动重校
  */
 
 import { FaceLandmarker, FilesetResolver } from '../assets/mediapipe/vision_bundle.mjs';
@@ -11,6 +14,7 @@ import { FocusTrendChart, downloadReportPng } from './charts.js';
 import { loadHistory, saveHistoryRecord, clearHistory } from './storage.js';
 
 const dom = {
+  videoStage: document.querySelector('.video-stage'),
   video: document.getElementById('webcam'),
   canvas: document.getElementById('overlayCanvas'),
   modelStatus: document.getElementById('modelStatus'),
@@ -97,6 +101,8 @@ let sessionStartMs = null;
 let lastAlertTime = 0;
 let lastAlertCode = null;
 let lastChartSampleMs = 0;
+let lastVideoTime = -1;
+let lastDetectTs = 0;
 let frameCount = 0;
 let fpsLastTime = performance.now();
 let audioCtx = null;
@@ -110,6 +116,8 @@ let pomoInterval = null;
 // 护眼倒计时状态
 let eyeTimer = null;
 let eyeSec = 20;
+
+const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 
 /** 触发语音或蜂鸣提示 */
 function triggerAlertAudio(alertCode, isDanger = false, customSpeech = null) {
@@ -147,44 +155,62 @@ function triggerAlertAudio(alertCode, isDanger = false, customSpeech = null) {
   }
 }
 
-/** 初始化本地同源 MediaPipe FaceLandmarker */
+/** 创建指定 delegate 的 FaceLandmarker 实例 */
+async function createLandmarkerWithDelegate(filesetResolver, delegate) {
+  return FaceLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath: './assets/models/face_landmarker.task',
+      delegate,
+    },
+    runningMode: 'VIDEO',
+    numFaces: 1,
+    minFaceDetectionConfidence: 0.4,
+    minFacePresenceConfidence: 0.4,
+    minTrackingConfidence: 0.4,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: false,
+  });
+}
+
+/** 初始化本地同源 MediaPipe FaceLandmarker（移动端优先稳定 CPU/WASM，桌面端优先 GPU 自动回退） */
 async function initFaceLandmarker() {
+  const order = isMobileDevice ? ['CPU', 'GPU'] : ['GPU', 'CPU'];
+  dom.modelStatus.textContent = '正在加载本地 AI 模型…';
+
+  let filesetResolver = null;
   try {
-    dom.modelStatus.textContent = '正在加载本地 AI 模型…';
-    const filesetResolver = await FilesetResolver.forVisionTasks('./assets/mediapipe/wasm');
-    faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-      baseOptions: {
-        modelAssetPath: './assets/models/face_landmarker.task',
-        delegate: 'GPU',
-      },
-      runningMode: 'VIDEO',
-      numFaces: 1,
-      outputFaceBlendshapes: true,
-      outputFacialTransformationMatrixes: true,
-    });
-    dom.modelStatus.textContent = 'AI 模型就绪（本地 GPU/WASM）';
-    dom.modelStatus.className = 'pill pill-ready';
+    filesetResolver = await FilesetResolver.forVisionTasks('./assets/mediapipe/wasm');
   } catch (err) {
-    console.warn('GPU delegate 不可用，自动回退至 CPU:', err);
+    console.error('WASM 运行时加载失败:', err);
+    dom.modelStatus.textContent = '模型加载失败（可用模拟演示）';
+    dom.modelStatus.className = 'pill pill-error';
+    return;
+  }
+
+  for (const delegate of order) {
     try {
-      const filesetResolver = await FilesetResolver.forVisionTasks('./assets/mediapipe/wasm');
-      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-        baseOptions: {
-          modelAssetPath: './assets/models/face_landmarker.task',
-          delegate: 'CPU',
-        },
-        runningMode: 'VIDEO',
-        numFaces: 1,
-        outputFaceBlendshapes: true,
-        outputFacialTransformationMatrixes: true,
-      });
-      dom.modelStatus.textContent = 'AI 模型就绪（本地 CPU/WASM）';
+      faceLandmarker = await createLandmarkerWithDelegate(filesetResolver, delegate);
+      dom.modelStatus.textContent = `AI 模型就绪（本地 ${delegate}/WASM）`;
       dom.modelStatus.className = 'pill pill-ready';
-    } catch (err2) {
-      console.error('模型初始化失败:', err2);
-      dom.modelStatus.textContent = '模型加载失败（可用模拟演示）';
-      dom.modelStatus.className = 'pill pill-error';
+      return;
+    } catch (err) {
+      console.warn(`${delegate} delegate 初始化失败，尝试回退:`, err);
     }
+  }
+
+  dom.modelStatus.textContent = '模型加载失败（可用模拟演示）';
+  dom.modelStatus.className = 'pill pill-error';
+}
+
+/** 同步视频容器与 Canvas 尺寸，保证手机竖屏/电脑横屏下关键点精准贴合人脸 */
+function syncVideoStageSize() {
+  const vw = dom.video.videoWidth;
+  const vh = dom.video.videoHeight;
+  if (!vw || !vh) return;
+  if (dom.canvas.width !== vw || dom.canvas.height !== vh) {
+    dom.canvas.width = vw;
+    dom.canvas.height = vh;
+    dom.videoStage.style.aspectRatio = `${vw} / ${vh}`;
   }
 }
 
@@ -198,7 +224,9 @@ function stopAll() {
     stream = null;
   }
   dom.video.srcObject = null;
+  dom.videoStage.style.aspectRatio = '';
   mode = 'idle';
+  lastVideoTime = -1;
   dom.btnToggleCam.textContent = '开启摄像头';
   dom.btnToggleDemo.textContent = '模拟演示模式';
   dom.btnCalibrate.disabled = true;
@@ -238,10 +266,9 @@ async function startCamera() {
   }
 
   try {
-    // 兼容手机竖屏与电脑横屏：优先前置摄像头，失败时自动降级为默认摄像头
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'user' } },
+        video: { facingMode: { ideal: 'user' }, width: { ideal: 640 }, height: { ideal: 480 } },
         audio: false,
       });
     } catch {
@@ -256,7 +283,6 @@ async function startCamera() {
     dom.video.setAttribute('webkit-playsinline', '');
     dom.video.srcObject = stream;
 
-    // 等待视频元数据就绪后再播放，避免 iOS 端 play() 竞态报错
     await new Promise((resolve) => {
       if (dom.video.readyState >= 1) return resolve();
       dom.video.onloadedmetadata = () => resolve();
@@ -266,13 +292,18 @@ async function startCamera() {
 
     dom.canvas.width = dom.video.videoWidth || 640;
     dom.canvas.height = dom.video.videoHeight || 480;
+    syncVideoStageSize();
 
     mode = 'camera';
+    lastVideoTime = -1;
+    // 每次开启真实摄像头时重置个人基准，等待前 10 帧稳定人脸自动校准
+    analyzer.resetBaseline();
     resetSessionData();
+    dom.calibLabel.textContent = '正在自动校准初始坐姿…';
     dom.emptyHint.classList.add('hidden');
     dom.btnToggleCam.textContent = '停止摄像头';
     dom.btnCalibrate.disabled = false;
-    appendLog(`已启动实时摄像头监测（${dom.canvas.width}×${dom.canvas.height} 本地推理）。`, 'info');
+    appendLog(`已启动实时摄像头监测（${dom.canvas.width}×${dom.canvas.height} 本地推理），请自然平视屏幕 1 秒完成自动校准。`, 'info');
     loop(performance.now());
   } catch (err) {
     console.error('摄像头启动失败:', err);
@@ -291,8 +322,13 @@ function startDemo() {
 
   dom.canvas.width = 960;
   dom.canvas.height = 600;
+  dom.videoStage.style.aspectRatio = '16 / 10';
   mode = 'demo';
+  analyzer.resetBaseline();
+  analyzer.baseline.faceScale = 0.28;
+  analyzer.baseline.faceCenterY = 0.48;
   resetSessionData();
+  dom.calibLabel.textContent = '演示默认基准';
   simulator.setScenario('normal');
   dom.demoScenarioBar.querySelectorAll('.chip').forEach((b) => {
     b.classList.toggle('active', b.dataset.scenario === 'normal');
@@ -325,32 +361,32 @@ function drawLandmarks(landmarks, level) {
   }
 
   ctx.strokeStyle = color;
-  ctx.lineWidth = 1.6;
+  ctx.lineWidth = Math.max(1.5, w / 360);
   ctx.setLineDash([6, 4]);
-  ctx.strokeRect(minX * w - 8, minY * h - 8, (maxX - minX) * w + 16, (maxY - minY) * h + 16);
+  ctx.strokeRect(minX * w - 6, minY * h - 6, (maxX - minX) * w + 12, (maxY - minY) * h + 12);
   ctx.setLineDash([]);
 
+  const dotSize = Math.max(2, w / 280);
   ctx.fillStyle = color;
   for (let i = 0; i < landmarks.length; i += 2) {
     const pt = landmarks[i];
-    ctx.fillRect((1 - pt.x) * w - 1.2, pt.y * h - 1.2, 2.4, 2.4);
+    ctx.fillRect((1 - pt.x) * w - dotSize / 2, pt.y * h - dotSize / 2, dotSize, dotSize);
   }
 }
 
-/** 在视频右下角绘制 3D 头部姿态方位仪 HUD（v3.0 新增） */
+/** 在视频右下角绘制 3D 头部姿态方位仪 HUD */
 function drawAttitudeHud(analysis) {
   if (!dom.toggleHud.checked || !analysis.hasFace) return;
 
   const w = dom.canvas.width;
   const h = dom.canvas.height;
-  const r = 46;
-  const cx = w - r - 20;
+  const r = Math.max(34, Math.min(48, Math.min(w, h) * 0.11));
+  const cx = w - r - 18;
   const cy = h - r - 22;
   const m = analysis.metrics;
   const color = analysis.level === 'danger' ? '#f87171' : analysis.level === 'warn' ? '#fbbf24' : '#34d399';
 
   ctx.save();
-  // 半透明圆形仪表面板
   ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
   ctx.lineWidth = 1.5;
@@ -359,7 +395,6 @@ function drawAttitudeHud(analysis) {
   ctx.fill();
   ctx.stroke();
 
-  // 安全中心圈
   ctx.strokeStyle = 'rgba(16, 185, 129, 0.45)';
   ctx.setLineDash([3, 3]);
   ctx.beginPath();
@@ -367,7 +402,6 @@ function drawAttitudeHud(analysis) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // 十字坐标轴（随 Roll 旋转）
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate((m.roll * Math.PI) / 180);
@@ -378,7 +412,6 @@ function drawAttitudeHud(analysis) {
   ctx.stroke();
   ctx.restore();
 
-  // 头部朝向光点（Yaw 控制水平，Pitch 控制垂直）
   const dx = Math.max(-r + 8, Math.min(r - 8, (m.yaw / 35) * (r - 10)));
   const dy = Math.max(-r + 8, Math.min(r - 8, (m.pitch / 30) * (r - 10)));
 
@@ -391,10 +424,9 @@ function drawAttitudeHud(analysis) {
 
   ctx.fillStyle = color;
   ctx.beginPath();
-  ctx.arc(cx + dx, cy + dy, 5, 0, Math.PI * 2);
+  ctx.arc(cx + dx, cy + dy, 4.5, 0, Math.PI * 2);
   ctx.fill();
 
-  // 标题标注
   ctx.fillStyle = '#cbd5e1';
   ctx.font = '11px ui-monospace, monospace';
   ctx.textAlign = 'center';
@@ -434,6 +466,11 @@ function renderBreakdown() {
 }
 
 function updateDashboard(analysis, nowMs) {
+  if (analysis.justAutoCalibrated) {
+    dom.calibLabel.textContent = '已自动校准（可随时重校）';
+    appendLog('已完成初始坐姿与个人眼部基线自动校准，监测已进入精准模式。', 'info');
+  }
+
   if (sessionStartMs) {
     const sec = Math.floor((nowMs - sessionStartMs) / 1000);
     const mm = String(Math.floor(sec / 60)).padStart(2, '0');
@@ -459,7 +496,7 @@ function updateDashboard(analysis, nowMs) {
     setMetric(dom.valPitch, dom.barPitch, `${m.pitch.toFixed(1)}°`, Math.min(100, (Math.abs(m.pitch) / 30) * 100), m.pitch > cfg.pitchDeg);
     setMetric(dom.valYaw, dom.barYaw, `${m.yaw.toFixed(1)}°`, Math.min(100, (Math.abs(m.yaw) / 35) * 100), Math.abs(m.yaw) > cfg.yawDeg);
     setMetric(dom.valRoll, dom.barRoll, `${m.roll.toFixed(1)}°`, Math.min(100, (Math.abs(m.roll) / 25) * 100), Math.abs(m.roll) > cfg.rollDeg);
-    setMetric(dom.valBlink, dom.barBlink, `${Math.round(m.blink * 100)}%`, Math.min(100, m.blink * 100), m.blink > 0.58);
+    setMetric(dom.valBlink, dom.barBlink, `${Math.round(m.blink * 100)}%`, Math.min(100, m.blink * 100), m.blink > 0.45);
     setMetric(dom.valYawn, dom.barYawn, `${Math.round(m.yawn * 100)}%`, Math.min(100, m.yawn * 100), m.yawn > 0.55);
     setMetric(dom.valScale, dom.barScale, `${Math.round(m.scaleRatio * 100)}%`, Math.min(100, (m.scaleRatio / 1.5) * 100), m.scaleRatio > cfg.scaleRatio);
   }
@@ -504,24 +541,46 @@ function appendLog(message, type = 'warn') {
 function loop(nowMs) {
   if (mode === 'idle') return;
 
-  frameCount += 1;
-  if (nowMs - fpsLastTime >= 1000) {
-    dom.fpsBadge.textContent = `FPS: ${frameCount}`;
-    frameCount = 0;
-    fpsLastTime = nowMs;
-  }
-
   if (mode === 'camera' && dom.video.readyState >= 2) {
-    const result = faceLandmarker.detectForVideo(dom.video, nowMs);
-    const features = analyzer.extractFromMediaPipe(result);
-    const analysis = analyzer.update(features, nowMs);
-    const landmarks = result.faceLandmarks?.[0] || null;
-    drawLandmarks(landmarks, analysis.level);
-    drawAttitudeHud(analysis);
-    updateDashboard(analysis, nowMs);
+    // 仅在新视频帧到达时执行 AI 推理，避免 120Hz 屏幕重复喂同一帧导致时间戳异常或卡顿
+    const currentTime = dom.video.currentTime;
+    if (currentTime !== lastVideoTime) {
+      lastVideoTime = currentTime;
+      syncVideoStageSize();
+
+      frameCount += 1;
+      if (nowMs - fpsLastTime >= 1000) {
+        dom.fpsBadge.textContent = `FPS: ${frameCount}`;
+        frameCount = 0;
+        fpsLastTime = nowMs;
+      }
+
+      // MediaPipe VIDEO 模式要求严格单调递增的整数毫秒时间戳
+      const detectTs = Math.max(lastDetectTs + 1, Math.round(nowMs));
+      lastDetectTs = detectTs;
+
+      try {
+        const result = faceLandmarker.detectForVideo(dom.video, detectTs);
+        const features = analyzer.extractFromMediaPipe(result, dom.canvas.width, dom.canvas.height);
+        const analysis = analyzer.update(features, detectTs, true);
+        const landmarks = result.faceLandmarks?.[0] || null;
+        drawLandmarks(landmarks, analysis.level);
+        drawAttitudeHud(analysis);
+        updateDashboard(analysis, detectTs);
+      } catch (err) {
+        console.warn('单帧推理异常已自动跳过:', err);
+      }
+    }
   } else if (mode === 'demo') {
+    frameCount += 1;
+    if (nowMs - fpsLastTime >= 1000) {
+      dom.fpsBadge.textContent = `FPS: ${frameCount}`;
+      frameCount = 0;
+      fpsLastTime = nowMs;
+    }
+
     const features = simulator.step(nowMs);
-    const analysis = analyzer.update(features, nowMs);
+    const analysis = analyzer.update(features, nowMs, false);
     simulator.render(ctx, dom.canvas.width, dom.canvas.height, features, dom.toggleMesh.checked, analysis.level);
     drawAttitudeHud(analysis);
     updateDashboard(analysis, nowMs);
@@ -567,7 +626,7 @@ function downloadReportTxt() {
   if (!latestReport) return;
   const lines = [
     '================================================',
-    '  FocusGuard AI v3.0 学习专注度与坐姿健康报告',
+    '  FocusGuard AI v4.0 学习专注度与坐姿健康报告',
     '================================================',
     `生成时间：${latestReport.generatedAt}`,
     `监测模式：${latestReport.modeLabel}`,
@@ -699,8 +758,8 @@ dom.btnSaveSession.addEventListener('click', () => {
 
 dom.btnCalibrate.addEventListener('click', () => {
   if (analyzer.calibrateCurrent()) {
-    dom.calibLabel.textContent = '已校准个人标准坐姿';
-    appendLog('已完成个人标准坐姿基准校准。', 'info');
+    dom.calibLabel.textContent = '已手动校准个人标准坐姿';
+    appendLog('已完成当前标准坐姿与眼部基线校准。', 'info');
   }
 });
 

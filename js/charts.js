@@ -223,7 +223,7 @@ export function downloadReportPng(report) {
   // 页脚
   ctx.fillStyle = '#64748b';
   ctx.font = '12px sans-serif';
-  ctx.fillText('FocusGuard AI v2.0 · 纯浏览器端本地视觉深度学习（MediaPipe FaceLandmarker）', 44, 598);
+  ctx.fillText('FocusGuard AI v4.0 · 纯浏览器端本地视觉深度学习（MediaPipe FaceLandmarker）', 44, 598);
 
   const link = document.createElement('a');
   link.download = `FocusGuard_学习健康报告_${Date.now()}.png`;

@@ -232,27 +232,53 @@ async function startCamera() {
     return;
   }
 
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    appendLog('当前浏览器不支持摄像头接口，请改用 Safari / Chrome 或体验模拟演示模式。', 'danger');
+    return;
+  }
+
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 960 }, height: { ideal: 600 }, facingMode: 'user' },
-      audio: false,
-    });
+    // 兼容手机竖屏与电脑横屏：优先前置摄像头，失败时自动降级为默认摄像头
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'user' } },
+        audio: false,
+      });
+    } catch {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false,
+      });
+    }
+
+    dom.video.muted = true;
+    dom.video.setAttribute('playsinline', '');
+    dom.video.setAttribute('webkit-playsinline', '');
     dom.video.srcObject = stream;
+
+    // 等待视频元数据就绪后再播放，避免 iOS 端 play() 竞态报错
+    await new Promise((resolve) => {
+      if (dom.video.readyState >= 1) return resolve();
+      dom.video.onloadedmetadata = () => resolve();
+      setTimeout(resolve, 1500);
+    });
     await dom.video.play();
 
-    dom.canvas.width = dom.video.videoWidth || 960;
-    dom.canvas.height = dom.video.videoHeight || 600;
+    dom.canvas.width = dom.video.videoWidth || 640;
+    dom.canvas.height = dom.video.videoHeight || 480;
 
     mode = 'camera';
     resetSessionData();
     dom.emptyHint.classList.add('hidden');
     dom.btnToggleCam.textContent = '停止摄像头';
     dom.btnCalibrate.disabled = false;
-    appendLog('已启动实时摄像头 AI 监测（本地 WASM 推理）。', 'info');
+    appendLog(`已启动实时摄像头监测（${dom.canvas.width}×${dom.canvas.height} 本地推理）。`, 'info');
     loop(performance.now());
   } catch (err) {
     console.error('摄像头启动失败:', err);
-    appendLog('无法访问摄像头（未授权或无设备），可直接体验“模拟演示模式”。', 'danger');
+    stopAll();
+    const detail = err ? `${err.name || 'Error'}: ${err.message || ''}` : '未知错误';
+    appendLog(`摄像头启动失败（${detail}），建议用系统 Safari/Chrome 打开或使用模拟演示模式。`, 'danger');
   }
 }
 

@@ -7,29 +7,32 @@ export const PRESET_THRESHOLDS = {
   relaxed: {
     label: '宽松',
     pitchDeg: 18,
-    yawDeg: 28,
-    rollDeg: 18,
+    yawDeg: 20,
+    rollDeg: 14,
+    gazeTh: 0.62,
     scaleRatio: 1.36,
     drowsyMs: 1600,
-    postureMs: 2000,
+    postureMs: 1600,
   },
   standard: {
     label: '标准',
     pitchDeg: 14,
-    yawDeg: 22,
-    rollDeg: 15,
+    yawDeg: 15,
+    rollDeg: 10,
+    gazeTh: 0.48,
     scaleRatio: 1.28,
     drowsyMs: 1200,
-    postureMs: 1500,
+    postureMs: 1000,
   },
   strict: {
     label: '严格',
     pitchDeg: 10,
-    yawDeg: 17,
-    rollDeg: 11,
+    yawDeg: 11,
+    rollDeg: 7,
+    gazeTh: 0.36,
     scaleRatio: 1.2,
     drowsyMs: 900,
-    postureMs: 1100,
+    postureMs: 800,
   },
 };
 
@@ -62,6 +65,7 @@ export class FocusPostureAnalyzer {
       roll: 0,
       blink: 0,
       yawn: 0,
+      gazeSide: 0,
       faceScale: 0.28,
       faceCenterY: 0.48,
       score: 95,
@@ -177,22 +181,41 @@ export class FocusPostureAnalyzer {
       euler = this.extractEulerFromMatrix(result.facialTransformationMatrixes[0].data);
     }
 
+    // 结合左右眼外眼角（33 / 263）连线计算 2D 歪头角，提升手机竖屏下 Roll 的稳定性
+    let eyeRoll = euler.roll;
+    if (landmarks[33] && landmarks[263]) {
+      const dx = landmarks[263].x - landmarks[33].x;
+      const dy = landmarks[263].y - landmarks[33].y;
+      eyeRoll = Math.atan2(dy, dx) * (180 / Math.PI);
+    }
+
     let eyeBlinkLeft = 0, eyeBlinkRight = 0, jawOpen = 0;
+    let lookOutL = 0, lookInL = 0, lookOutR = 0, lookInR = 0;
     if (result.faceBlendshapes && result.faceBlendshapes.length > 0) {
       const categories = result.faceBlendshapes[0].categories;
       for (const c of categories) {
         if (c.categoryName === 'eyeBlinkLeft') eyeBlinkLeft = c.score;
         else if (c.categoryName === 'eyeBlinkRight') eyeBlinkRight = c.score;
         else if (c.categoryName === 'jawOpen') jawOpen = c.score;
+        else if (c.categoryName === 'eyeLookOutLeft') lookOutL = c.score;
+        else if (c.categoryName === 'eyeLookInLeft') lookInL = c.score;
+        else if (c.categoryName === 'eyeLookOutRight') lookOutR = c.score;
+        else if (c.categoryName === 'eyeLookInRight') lookInR = c.score;
       }
     }
+
+    // 眼球左右斜视强度（融合双眼视线偏移，捕捉“头不动但眼斜视走神”）
+    const gazeLeft = (lookOutL + lookInR) / 2;
+    const gazeRight = (lookOutR + lookInL) / 2;
+    const gazeSide = Math.max(gazeLeft, gazeRight);
 
     return {
       pitch: euler.pitch,
       yaw: euler.yaw,
-      roll: euler.roll,
+      roll: (euler.roll + eyeRoll) / 2,
       blink: (eyeBlinkLeft + eyeBlinkRight) / 2,
       yawn: jawOpen,
+      gazeSide,
       faceScale,
       faceCenterY,
     };
@@ -228,6 +251,7 @@ export class FocusPostureAnalyzer {
     this.smooth.roll = this.smooth.roll * (1 - alpha) + rawFeatures.roll * alpha;
     this.smooth.blink = this.smooth.blink * 0.55 + rawFeatures.blink * 0.45;
     this.smooth.yawn = this.smooth.yawn * 0.65 + rawFeatures.yawn * 0.35;
+    this.smooth.gazeSide = this.smooth.gazeSide * 0.6 + (rawFeatures.gazeSide || 0) * 0.4;
     this.smooth.faceScale = this.smooth.faceScale * (1 - alpha) + rawFeatures.faceScale * alpha;
     this.smooth.faceCenterY = this.smooth.faceCenterY * (1 - alpha) + rawFeatures.faceCenterY * alpha;
 
@@ -243,7 +267,9 @@ export class FocusPostureAnalyzer {
     this.timers.slouchMs = (dPitch > cfg.pitchDeg || dCenterY > 0.11) ? this.timers.slouchMs + dt : Math.max(0, this.timers.slouchMs - dt * 2);
     this.timers.tooCloseMs = scaleRatio > cfg.scaleRatio ? this.timers.tooCloseMs + dt : Math.max(0, this.timers.tooCloseMs - dt * 2);
     this.timers.tiltMs = dRoll > cfg.rollDeg ? this.timers.tiltMs + dt : Math.max(0, this.timers.tiltMs - dt * 2);
-    this.timers.distractedMs = dYaw > cfg.yawDeg ? this.timers.distractedMs + dt : Math.max(0, this.timers.distractedMs - dt * 2);
+    // 视线走神判定：头部偏航 OR 眼球明显斜视（头未大转但眼已离屏）
+    const isGazeOff = dYaw > cfg.yawDeg || this.smooth.gazeSide > (cfg.gazeTh || 0.48);
+    this.timers.distractedMs = isGazeOff ? this.timers.distractedMs + dt : Math.max(0, this.timers.distractedMs - dt * 2);
 
     let targetScore = 100;
     targetScore -= Math.max(0, dPitch - cfg.pitchDeg * 0.55) * 1.45;

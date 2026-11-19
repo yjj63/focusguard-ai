@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FocusGuard AI v3.0 · 浏览器端实时专注度与坐姿健康助手</title>
+  <link rel="stylesheet" href="./css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">FG</div>
+      <div>
+        <h1>FocusGuard AI <span class="badge-ver">v3.0 正式版</span></h1>
+        <p class="subtitle">基于浏览器端深度学习（MediaPipe FaceLandmarker）的实时专注度与坐姿健康监测系统 · 本地推理零上传</p>
+      </div>
+    </div>
+    <div class="topbar-status">
+      <span id="modelStatus" class="pill pill-loading">正在初始化 AI 模型…</span>
+      <span id="fpsBadge" class="pill pill-neutral">FPS: --</span>
+      <button id="btnThemeToggle" class="btn btn-secondary btn-sm" title="切换深色/浅色主题">☀ 浅色</button>
+      <button id="btnEyeBreak" class="btn btn-secondary btn-sm">👁 护眼放松</button>
+      <button id="btnOpenHistory" class="btn btn-secondary btn-sm">📊 历史档案</button>
+      <button id="btnOpenReport" class="btn btn-outline btn-sm">📄 生成报告</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左侧主列：视觉监测窗口 + 趋势分析 -->
+    <div class="main-col">
+      <section class="panel stage-panel">
+        <div class="panel-header">
+          <h2>实时视觉监测窗口</h2>
+          <div class="controls-inline">
+            <label class="toggle">
+              <input type="checkbox" id="toggleMesh" checked />
+              <span>关键点叠加</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" id="toggleHud" checked />
+              <span>3D 姿态仪</span>
+            </label>
+            <label class="select-wrap">
+              <span>提醒方式</span>
+              <select id="alertVoiceMode">
+                <option value="voice" selected>中文语音播报</option>
+                <option value="beep">轻柔提示音</option>
+                <option value="mute">静音</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="video-stage">
+          <video id="webcam" autoplay playsinline muted></video>
+          <canvas id="overlayCanvas"></canvas>
+
+          <!-- 左上角实时状态横幅 -->
+          <div id="liveStateBanner" class="state-banner state-idle">
+            <span class="dot"></span>
+            <span id="liveStateText">待机中：请开启摄像头或进入模拟演示模式</span>
+          </div>
+
+          <!-- 空态引导 -->
+          <div id="emptyHint" class="empty-hint">
+            <div class="empty-icon">📷</div>
+            <h3>纯浏览器本地 AI 推理 · 保护隐私</h3>
+            <p>478 维人脸关键点与三维姿态矩阵完全在本地 WebAssembly 中运行，视频画面零上传；无摄像头设备可直接点击“模拟演示”。</p>
+            <div class="empty-actions">
+              <button id="btnStartCamHero" class="btn btn-primary">开启摄像头监测</button>
+              <button id="btnStartDemoHero" class="btn btn-secondary">无摄像头模拟演示</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <button id="btnToggleCam" class="btn btn-primary">开启摄像头</button>
+            <button id="btnToggleDemo" class="btn btn-secondary">模拟演示模式</button>
+            <button id="btnCalibrate" class="btn btn-outline" disabled>校准标准坐姿</button>
+            <button id="btnSaveSession" class="btn btn-secondary">保存至档案</button>
+            <button id="btnResetSession" class="btn btn-secondary">重置统计</button>
+          </div>
+
+          <div id="demoScenarioBar" class="demo-bar hidden">
+            <span class="demo-label">演示场景：</span>
+            <button class="chip active" data-scenario="normal">标准专注</button>
+            <button class="chip" data-scenario="slouch">低头驼背</button>
+            <button class="chip" data-scenario="too_close">离屏过近</button>
+            <button class="chip" data-scenario="drowsy">疲劳闭眼</button>
+            <button class="chip" data-scenario="distracted">左右走神</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 实时趋势图 + 异常分布 -->
+      <section class="panel analytics-panel">
+        <div class="analytics-grid">
+          <div class="chart-box">
+            <div class="panel-header">
+              <h2>实时专注度趋势（最近 60 秒）</h2>
+              <span class="hint-text">绿色 ≥80 · 黄色 ≥60</span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="trendChart"></canvas>
+            </div>
+          </div>
+
+          <div class="dist-box">
+            <div class="panel-header">
+              <h2>异常事件分类统计</h2>
+              <span id="topIssueHint" class="hint-text">暂无异常</span>
+            </div>
+            <div id="breakdownList" class="breakdown-list"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- 右侧边栏：番茄钟 + 评分卡 + 视觉特征 + 灵敏度 + 日志 -->
+    <aside class="sidebar">
+      <!-- 新增：番茄专注时钟 -->
+      <section class="panel pomo-panel">
+        <div class="panel-header">
+          <h2>🍅 番茄专注时钟</h2>
+          <div class="preset-group">
+            <button class="chip-sm active" data-pomo="25">25分</button>
+            <button class="chip-sm" data-pomo="15">15分</button>
+            <button class="chip-sm" data-pomo="5">5分</button>
+          </div>
+        </div>
+        <div class="pomo-body">
+          <div id="pomoDisplay" class="pomo-clock">25:00</div>
+          <div class="pomo-actions">
+            <button id="btnPomoStart" class="btn btn-primary btn-sm">开始专注</button>
+            <button id="btnPomoReset" class="btn btn-secondary btn-sm">重置</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel score-panel">
+        <div class="panel-header">
+          <h2>实时专注与体态评估</h2>
+          <span id="sessionTimer" class="mono">00:00</span>
+        </div>
+        <div class="score-grid">
+          <div class="score-ring-wrap">
+            <div id="scoreRing" class="score-ring">
+              <span id="focusScoreValue">--</span>
+              <small>综合评分</small>
+            </div>
+          </div>
+          <div class="score-summary">
+            <div class="summary-row">
+              <span>当前状态</span>
+              <strong id="statusLabel">未开始</strong>
+            </div>
+            <div class="summary-row">
+              <span>坐姿基准</span>
+              <strong id="calibLabel">未校准（默认阈值）</strong>
+            </div>
+            <div class="summary-row">
+              <span>异常提醒次数</span>
+              <strong id="alertCountValue">0 次</strong>
+            </div>
+            <div class="summary-row">
+              <span>专注保持率</span>
+              <strong id="focusRateValue">--%</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel metrics-panel">
+        <div class="panel-header">
+          <h2>AI 视觉特征实时读数</h2>
+          <span class="hint-text">478 关键点 + 欧拉角</span>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <span class="metric-name">低头俯仰 (Pitch)</span>
+            <strong id="valPitch" class="metric-val">--°</strong>
+            <div class="bar"><div id="barPitch" class="bar-fill"></div></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-name">左右偏航 (Yaw)</span>
+            <strong id="valYaw" class="metric-val">--°</strong>
+            <div class="bar"><div id="barYaw" class="bar-fill"></div></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-name">歪头滚转 (Roll)</span>
+            <strong id="valRoll" class="metric-val">--°</strong>
+            <div class="bar"><div id="barRoll" class="bar-fill"></div></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-name">闭眼疲劳度 (Blink)</span>
+            <strong id="valBlink" class="metric-val">--%</strong>
+            <div class="bar"><div id="barBlink" class="bar-fill"></div></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-name">哈欠张口 (Yawn)</span>
+            <strong id="valYawn" class="metric-val">--%</strong>
+            <div class="bar"><div id="barYawn" class="bar-fill"></div></div>
+          </div>
+          <div class="metric-card">
+            <span class="metric-name">距屏比例 (Scale)</span>
+            <strong id="valScale" class="metric-val">--%</strong>
+            <div class="bar"><div id="barScale" class="bar-fill"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel tuning-panel">
+        <div class="panel-header">
+          <h2>AI 判定灵敏度调节</h2>
+          <div class="preset-group">
+            <button class="chip-sm" data-preset="relaxed">宽松</button>
+            <button class="chip-sm active" data-preset="standard">标准</button>
+            <button class="chip-sm" data-preset="strict">严格</button>
+          </div>
+        </div>
+        <div class="sliders">
+          <label class="slider-row">
+            <span>低头角度阈值 <strong id="lblPitchTh">14°</strong></span>
+            <input type="range" id="sliderPitch" min="8" max="24" step="1" value="14" />
+          </label>
+          <label class="slider-row">
+            <span>前倾距屏阈值 <strong id="lblScaleTh">128%</strong></span>
+            <input type="range" id="sliderScale" min="115" max="145" step="1" value="128" />
+          </label>
+          <label class="slider-row">
+            <span>疲劳闭眼时长 <strong id="lblDrowsyTh">1.2s</strong></span>
+            <input type="range" id="sliderDrowsy" min="700" max="2200" step="100" value="1200" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-header">
+          <h2>异常事件日志</h2>
+          <button id="btnClearLog" class="btn-link">清空</button>
+        </div>
+        <ul id="eventLogList" class="log-list">
+          <li class="log-empty">暂无异常记录，开始监测后将自动记录不良坐姿与疲劳事件。</li>
+        </ul>
+      </section>
+    </aside>
+  </main>
+
+  <!-- 学习健康报告弹窗 -->
+  <div id="reportModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>本次学习专注度与坐姿健康报告</h3>
+        <button id="btnCloseModal" class="btn-link">✕ 关闭</button>
+      </div>
+      <div id="reportBody" class="modal-body"></div>
+      <div class="modal-footer">
+        <button id="btnSaveFromModal" class="btn btn-outline">存入历史档案</button>
+        <button id="btnDownloadTxt" class="btn btn-secondary">导出 TXT 报告</button>
+        <button id="btnDownloadPng" class="btn btn-primary">保存高清 PNG 报告图</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 历史学习档案弹窗 -->
+  <div id="historyModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card modal-wide">
+      <div class="modal-header">
+        <h3>📊 本地历史学习档案（最近 12 次）</h3>
+        <button id="btnCloseHistory" class="btn-link">✕ 关闭</button>
+      </div>
+      <div id="historyBody" class="modal-body"></div>
+      <div class="modal-footer">
+        <button id="btnClearHistory" class="btn btn-secondary">清空全部档案</button>
+        <button id="btnCloseHistory2" class="btn btn-primary">完成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 20-20-20 护眼与颈椎放松弹窗 -->
+  <div id="eyeModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card eye-card">
+      <div class="modal-header">
+        <h3>👁 20-20-20 护眼与颈椎放松引导</h3>
+        <button id="btnCloseEye" class="btn-link">✕ 结束</button>
+      </div>
+      <div class="eye-body">
+        <div id="eyeCountdown" class="eye-timer">20s</div>
+        <p class="eye-tip">请将视线移向 <strong>6 米（20 英尺）外</strong> 的远处景物，缓慢深呼吸并轻轻转动肩颈。</p>
+        <ul class="eye-steps">
+          <li>① 远眺窗外或房间最远处，放松睫状肌</li>
+          <li>② 缓慢向左、向右各侧倾头部 5 秒，舒缓斜方肌</li>
+          <li>③ 自然眨眼 5–8 次，缓解眼干疲劳</li>
+        </ul>
+      </div>
+      <div class="modal-footer">
+        <button id="btnRestartEye" class="btn btn-secondary">重新计时 20s</button>
+        <button id="btnDoneEye" class="btn btn-primary">放松完成</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    <span>《人工智能基础与应用》课程设计 · FocusGuard AI v3.0 正式版 · 纯前端 WebAssembly 本地推理（MediaPipe Tasks Vision）</span>
+  </footer>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
